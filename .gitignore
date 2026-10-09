@@ -1,0 +1,17 @@
+# Build and IDE output
+[Bb]in/
+[Oo]bj/
+.vs/
+
+# Locally published executables
+publish/
+standalone/
+single-exe-win-x64/
+single-exe-delivery/
+
+# Runtime credentials
+appsettings.json
+appsettings.Development.json
+
+# Local test fixtures
+TestData/
