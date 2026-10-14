@@ -31,7 +31,17 @@ public sealed class FtpMirror(
                     throw new DirectoryNotFoundException($"The configured SFTP root does not exist: {RemoteRootPath}");
                 }
 
-                DiscoverTransfers(discoveryClient, sourceDirectory, string.Empty, transfers, cancellationToken);
+                var rootDirectoryIndex = ListRemoteDirectory(discoveryClient, RemoteRootPath);
+                var knownRemoteDirectories = new HashSet<string>(StringComparer.Ordinal) { string.Empty };
+                DiscoverTransfers(
+                    discoveryClient,
+                    sourceDirectory,
+                    string.Empty,
+                    rootDirectoryIndex,
+                    knownRemoteDirectories,
+                    transfers,
+                    cancellationToken);
+                EnsureRemoteDirectories(discoveryClient, transfers, knownRemoteDirectories);
             }
             finally
             {
@@ -65,6 +75,8 @@ public sealed class FtpMirror(
         SftpClient client,
         string localDirectory,
         string relativePath,
+        RemoteDirectoryIndex remoteDirectoryIndex,
+        ISet<string> knownRemoteDirectories,
         ICollection<TransferJob> transfers,
         CancellationToken cancellationToken)
     {
@@ -78,8 +90,20 @@ public sealed class FtpMirror(
 
             if (Directory.Exists(itemPath))
             {
-                EnsureDirectory(client, childPath);
-                DiscoverTransfers(client, itemPath, childPath, transfers, cancellationToken);
+                var childRemoteDirectoryIndex = GetRemoteDirectoryIndex(
+                    client,
+                    childPath,
+                    name,
+                    remoteDirectoryIndex,
+                    knownRemoteDirectories);
+                DiscoverTransfers(
+                    client,
+                    itemPath,
+                    childPath,
+                    childRemoteDirectoryIndex,
+                    knownRemoteDirectories,
+                    transfers,
+                    cancellationToken);
             }
             else if (File.Exists(itemPath))
             {
@@ -88,25 +112,16 @@ public sealed class FtpMirror(
                 {
                     logger.LogDebug("Skipped old file {Path}.", childPath);
                 }
-                else if (!DestinationHasCurrentFile(client, childPath, sourceFile))
+                else if (remoteDirectoryIndex.Files.Contains(name))
+                {
+                    logger.LogDebug("Skipped existing remote file {Path}.", childPath);
+                }
+                else
                 {
                     transfers.Add(new TransferJob(sourceFile, childPath));
                 }
             }
         }
-    }
-
-    private bool DestinationHasCurrentFile(SftpClient client, string relativePath, FileInfo sourceFile)
-    {
-        var remotePath = BuildRemotePath(relativePath);
-        if (!client.Exists(remotePath))
-        {
-            return false;
-        }
-
-        var attributes = client.GetAttributes(remotePath);
-        return attributes.Size == sourceFile.Length &&
-               attributes.LastWriteTimeUtc >= sourceFile.LastWriteTimeUtc;
     }
 
     private void UploadFile(TransferJob transfer, CancellationToken cancellationToken)
@@ -125,7 +140,7 @@ public sealed class FtpMirror(
                 bufferSize: 81920,
                 useAsync: false);
 
-            client.UploadFile(sourceStream, BuildRemotePath(transfer.RelativePath), canOverride: true);
+            client.UploadFile(sourceStream, BuildRemotePath(transfer.RelativePath), canOverride: false);
             logger.LogInformation("Copied {Path}.", transfer.RelativePath);
         }
         finally
@@ -137,13 +152,82 @@ public sealed class FtpMirror(
         }
     }
 
-    private void EnsureDirectory(SftpClient client, string relativePath)
+    private RemoteDirectoryIndex GetRemoteDirectoryIndex(
+        SftpClient client,
+        string relativePath,
+        string directoryName,
+        RemoteDirectoryIndex parentDirectoryIndex,
+        ISet<string> knownRemoteDirectories)
     {
-        var remotePath = BuildRemotePath(relativePath);
-        if (!client.Exists(remotePath))
+        if (parentDirectoryIndex.Files.Contains(directoryName))
         {
-            client.CreateDirectory(remotePath);
+            return new RemoteDirectoryIndex();
         }
+
+        var remotePath = BuildRemotePath(relativePath);
+        if (parentDirectoryIndex.Directories.Contains(directoryName))
+        {
+            knownRemoteDirectories.Add(relativePath);
+            return ListRemoteDirectory(client, remotePath);
+        }
+
+        return new RemoteDirectoryIndex();
+    }
+
+    private void EnsureRemoteDirectories(
+        SftpClient client,
+        IEnumerable<TransferJob> transfers,
+        ISet<string> knownRemoteDirectories)
+    {
+        var requiredDirectories = transfers
+            .SelectMany(transfer => GetParentDirectories(transfer.RelativePath))
+            .Distinct(StringComparer.Ordinal)
+            .OrderBy(path => path.Count(character => character == '/'))
+            .ThenBy(path => path, StringComparer.Ordinal);
+
+        foreach (var directoryPath in requiredDirectories)
+        {
+            if (knownRemoteDirectories.Contains(directoryPath))
+            {
+                continue;
+            }
+
+            client.CreateDirectory(BuildRemotePath(directoryPath));
+            knownRemoteDirectories.Add(directoryPath);
+        }
+    }
+
+    private static IEnumerable<string> GetParentDirectories(string relativeFilePath)
+    {
+        var segments = relativeFilePath.Split('/', StringSplitOptions.RemoveEmptyEntries);
+        for (var segmentCount = 1; segmentCount < segments.Length; segmentCount++)
+        {
+            yield return string.Join('/', segments[..segmentCount]);
+        }
+    }
+
+    private static RemoteDirectoryIndex ListRemoteDirectory(SftpClient client, string remotePath)
+    {
+        var directoryIndex = new RemoteDirectoryIndex();
+
+        foreach (var entry in client.ListDirectory(remotePath))
+        {
+            if (entry.Name is "." or "..")
+            {
+                continue;
+            }
+
+            if (entry.IsDirectory)
+            {
+                directoryIndex.Directories.Add(entry.Name);
+            }
+            else
+            {
+                directoryIndex.Files.Add(entry.Name);
+            }
+        }
+
+        return directoryIndex;
     }
 
     private SftpClient CreateSftpClient() => new(
@@ -163,4 +247,10 @@ public sealed class FtpMirror(
         string.IsNullOrEmpty(parent) ? name : parent + "/" + name;
 
     private sealed record TransferJob(FileInfo SourceFile, string RelativePath);
+
+    private sealed class RemoteDirectoryIndex
+    {
+        public HashSet<string> Directories { get; } = new(StringComparer.Ordinal);
+        public HashSet<string> Files { get; } = new(StringComparer.Ordinal);
+    }
 }

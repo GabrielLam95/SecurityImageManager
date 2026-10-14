@@ -1,10 +1,10 @@
 # FTP Mirror Service
 
-This .NET 10 Windows Service checks the configured local source directory every 2 minutes and copies only new or changed files modified within the preceding 60 minutes to an SFTP destination. It never deletes a destination file. Up to 5 files upload concurrently.
+This .NET 10 Windows Service checks the configured local source directory every 2 minutes and copies only files modified within the preceding 60 minutes that do not already exist on the SFTP destination. It never deletes or overwrites a destination file, and creates remote folders only when needed for an eligible upload. Up to 5 files upload concurrently.
 
 ## Configuration
 
-The runtime configuration and its SFTP credential are intentionally not committed. Copy `appsettings.example.json` to `appsettings.json`, then fill in the real values before building or running the service. You can also override these settings through environment variables:
+The committed `appsettings.json` contains the configured SFTP connection information. Treat access to this repository as access to those credentials. You can override these settings through environment variables:
 
 ```text
 FtpMirror__UserName=<FTP username>
